@@ -18,6 +18,7 @@ const VM_DATA_SOURCE = "victoriametrics";
 const DEFAULT_QUERY_PATH = "/prometheus/api/v1/query_range";
 const DEFAULT_STEP = "15m";
 const DEFAULT_TIMEOUT_MS = 30000;
+const INGRESS_VALIDATE_INTERVAL_MS = 60000;
 
 const vmConfigByCard = new WeakMap();
 
@@ -33,12 +34,22 @@ function normalizeBaseUrl(url) {
 }
 
 function normalizeQueryPath(path) {
-  const value = typeof path === "string" && path.trim() ? path.trim() : DEFAULT_QUERY_PATH;
+  const value =
+    typeof path === "string" && path.trim() ? path.trim() : DEFAULT_QUERY_PATH;
   return value.startsWith("/") ? value : `/${value}`;
 }
 
+function normalizeAddonSlug(slug) {
+  if (typeof slug !== "string" || !slug.trim()) {
+    return null;
+  }
+  return slug.trim();
+}
+
 function resolveVmConfig(config) {
-  const globalConfig = isObject(config?.victoriametrics) ? config.victoriametrics : {};
+  const globalConfig = isObject(config?.victoriametrics)
+    ? config.victoriametrics
+    : {};
   const entities = Array.isArray(config?.entities) ? config.entities : [];
   const vmEntities = new Map();
 
@@ -77,11 +88,27 @@ function resolveVmConfig(config) {
     throw new Error("victoriametrics.timeout_ms must be a positive number");
   }
 
+  const addonSlug = normalizeAddonSlug(globalConfig.addon_slug);
+  const directUrl =
+    typeof globalConfig.url === "string" && globalConfig.url.trim()
+      ? normalizeBaseUrl(globalConfig.url)
+      : null;
+
+  if (!addonSlug && !directUrl) {
+    throw new Error(
+      "victoriametrics requires addon_slug for Home Assistant Ingress or url for direct access",
+    );
+  }
+
   return {
-    url: normalizeBaseUrl(globalConfig.url),
+    addonSlug,
+    url: directUrl,
     queryPath: normalizeQueryPath(globalConfig.query_path),
     timeoutMs,
     entities: vmEntities,
+    ingressUrl: null,
+    ingressSession: null,
+    ingressLastValidated: 0,
   };
 }
 
@@ -93,23 +120,135 @@ function configForUpstreamCard(config) {
   return {
     ...config,
     entities: config.entities.map((entityConfig) => {
-      if (!isObject(entityConfig) || entityConfig.data_source !== VM_DATA_SOURCE) {
+      if (
+        !isObject(entityConfig) ||
+        entityConfig.data_source !== VM_DATA_SOURCE
+      ) {
         return entityConfig;
       }
 
       // Force only VictoriaMetrics-backed entities through the upstream card's
       // already-supported history pipeline. Keep entity metadata in Home Assistant.
-      const {
-        victoriametrics: _victoriametrics,
-        ...rest
-      } = entityConfig;
+      const { victoriametrics: _victoriametrics, ...rest } = entityConfig;
       return { ...rest, data_source: "history" };
     }),
   };
 }
 
-function makeRangeUrl(vmConfig, entityConfig, startTime, endTime) {
-  const endpoint = `${vmConfig.url}${vmConfig.queryPath}`;
+function setIngressCookie(session) {
+  const secure = window.location.protocol === "https:" ? ";Secure" : "";
+  document.cookie =
+    `ingress_session=${session};path=/api/hassio_ingress/;SameSite=Strict${secure}`;
+}
+
+function supervisorErrorDetail(error) {
+  return error?.message ?? error?.error?.message ?? String(error);
+}
+
+async function createIngressSession(hass, vmConfig) {
+  let response;
+  try {
+    response = await hass.callWS({
+      type: "supervisor/api",
+      endpoint: "/ingress/session",
+      method: "post",
+    });
+  } catch (error) {
+    throw new Error(
+      `${vmConfig.addonSlug}: unable to create Home Assistant Ingress session: ${supervisorErrorDetail(error)}`,
+    );
+  }
+
+  const session = response?.session;
+  if (typeof session !== "string" || !session) {
+    throw new Error(
+      `${vmConfig.addonSlug}: Home Assistant returned no Ingress session`,
+    );
+  }
+
+  setIngressCookie(session);
+  vmConfig.ingressSession = session;
+  vmConfig.ingressLastValidated = Date.now();
+}
+
+async function validateIngressSession(hass, vmConfig) {
+  if (!vmConfig.ingressSession) {
+    await createIngressSession(hass, vmConfig);
+    return;
+  }
+
+  if (
+    Date.now() - vmConfig.ingressLastValidated <
+    INGRESS_VALIDATE_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  try {
+    await hass.callWS({
+      type: "supervisor/api",
+      endpoint: "/ingress/validate_session",
+      method: "post",
+      data: { session: vmConfig.ingressSession },
+    });
+    vmConfig.ingressLastValidated = Date.now();
+  } catch (_error) {
+    await createIngressSession(hass, vmConfig);
+  }
+}
+
+async function resolveIngressUrl(hass, vmConfig) {
+  if (vmConfig.ingressUrl) {
+    return vmConfig.ingressUrl;
+  }
+
+  let addon;
+  try {
+    addon = await hass.callWS({
+      type: "supervisor/api",
+      endpoint: `/addons/${vmConfig.addonSlug}/info`,
+      method: "get",
+    });
+  } catch (error) {
+    throw new Error(
+      `${vmConfig.addonSlug}: unable to read Home Assistant add-on information: ${supervisorErrorDetail(error)}`,
+    );
+  }
+
+  if (!addon?.version) {
+    throw new Error(`${vmConfig.addonSlug}: Home Assistant add-on is not installed`);
+  }
+  if (addon.state !== "started") {
+    throw new Error(
+      `${vmConfig.addonSlug}: Home Assistant add-on must be started (current state: ${addon.state ?? "unknown"})`,
+    );
+  }
+  if (!addon.ingress || typeof addon.ingress_url !== "string" || !addon.ingress_url) {
+    throw new Error(
+      `${vmConfig.addonSlug}: Home Assistant add-on does not expose an Ingress URL`,
+    );
+  }
+
+  vmConfig.ingressUrl = normalizeBaseUrl(addon.ingress_url);
+  return vmConfig.ingressUrl;
+}
+
+async function resolveVmBaseUrl(hass, vmConfig, forceNewIngressSession = false) {
+  if (!vmConfig.addonSlug) {
+    return vmConfig.url;
+  }
+
+  if (forceNewIngressSession) {
+    await createIngressSession(hass, vmConfig);
+  } else {
+    await validateIngressSession(hass, vmConfig);
+  }
+
+  return resolveIngressUrl(hass, vmConfig);
+}
+
+function makeRangeUrl(baseUrl, vmConfig, entityConfig, startTime, endTime) {
+  const endpoint = `${baseUrl}${vmConfig.queryPath}`;
   const url = new URL(endpoint, window.location.href);
   url.searchParams.set("query", entityConfig.query);
   url.searchParams.set("start", String(startTime.getTime() / 1000));
@@ -118,30 +257,63 @@ function makeRangeUrl(vmConfig, entityConfig, startTime, endTime) {
   return url;
 }
 
-async function queryVictoriaMetrics(vmConfig, entityId, startTime, endTime) {
+async function fetchVmRange(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      method: "GET",
+      credentials: "same-origin",
+      signal: controller.signal,
+    });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+async function queryVictoriaMetrics(
+  hass,
+  vmConfig,
+  entityId,
+  startTime,
+  endTime,
+) {
   const entityConfig = vmConfig.entities.get(entityId);
   if (!entityConfig) {
     return [];
   }
 
-  const url = makeRangeUrl(vmConfig, entityConfig, startTime, endTime);
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), vmConfig.timeoutMs);
-
   let response;
+  let url;
+
   try {
-    response = await fetch(url, {
-      method: "GET",
-      credentials: "same-origin",
-      signal: controller.signal,
-    });
+    const baseUrl = await resolveVmBaseUrl(hass, vmConfig);
+    url = makeRangeUrl(baseUrl, vmConfig, entityConfig, startTime, endTime);
+    response = await fetchVmRange(url, vmConfig.timeoutMs);
+
+    // Ingress sessions can expire while a dashboard remains open. Recreate the
+    // session once and retry the exact request before surfacing an error.
+    if (
+      vmConfig.addonSlug &&
+      (response.status === 401 || response.status === 403)
+    ) {
+      const refreshedBaseUrl = await resolveVmBaseUrl(hass, vmConfig, true);
+      url = makeRangeUrl(
+        refreshedBaseUrl,
+        vmConfig,
+        entityConfig,
+        startTime,
+        endTime,
+      );
+      response = await fetchVmRange(url, vmConfig.timeoutMs);
+    }
   } catch (error) {
-    const detail = error?.name === "AbortError"
-      ? `request timed out after ${vmConfig.timeoutMs} ms`
-      : error?.message ?? String(error);
+    const detail =
+      error?.name === "AbortError"
+        ? `request timed out after ${vmConfig.timeoutMs} ms`
+        : error?.message ?? String(error);
     throw new Error(`${entityId}: VictoriaMetrics request failed: ${detail}`);
-  } finally {
-    window.clearTimeout(timer);
   }
 
   if (!response.ok) {
@@ -152,7 +324,8 @@ async function queryVictoriaMetrics(vmConfig, entityId, startTime, endTime) {
 
   const payload = await response.json();
   if (payload?.status !== "success") {
-    const detail = payload?.error ?? payload?.errorType ?? "unknown VictoriaMetrics error";
+    const detail =
+      payload?.error ?? payload?.errorType ?? "unknown VictoriaMetrics error";
     throw new Error(`${entityId}: VictoriaMetrics query failed: ${detail}`);
   }
 
@@ -175,7 +348,10 @@ async function queryVictoriaMetrics(vmConfig, entityId, startTime, endTime) {
   const values = Array.isArray(series[0].values) ? series[0].values : [];
   return values
     .map(([timestamp, value]) => [Number(timestamp), Number(value)])
-    .filter(([timestamp, value]) => Number.isFinite(timestamp) && Number.isFinite(value))
+    .filter(
+      ([timestamp, value]) =>
+        Number.isFinite(timestamp) && Number.isFinite(value),
+    )
     .sort((a, b) => a[0] - b[0]);
 }
 
@@ -201,11 +377,27 @@ function vmSamplesToRestHistory(entityId, samples) {
   });
 }
 
-async function queryVmEntities(vmConfig, entityIds, startTime, endTime, converter) {
+async function queryVmEntities(
+  hass,
+  vmConfig,
+  entityIds,
+  startTime,
+  endTime,
+  converter,
+) {
   const entries = await Promise.all(
     entityIds.map(async (entityId) => [
       entityId,
-      converter(entityId, await queryVictoriaMetrics(vmConfig, entityId, startTime, endTime)),
+      converter(
+        entityId,
+        await queryVictoriaMetrics(
+          hass,
+          vmConfig,
+          entityId,
+          startTime,
+          endTime,
+        ),
+      ),
     ]),
   );
   return Object.fromEntries(entries);
@@ -231,7 +423,10 @@ function splitEntityIds(entityIds, vmConfig) {
 }
 
 async function interceptCallWs(hass, vmConfig, message) {
-  if (message?.type !== "history/history_during_period" || !Array.isArray(message.entity_ids)) {
+  if (
+    message?.type !== "history/history_during_period" ||
+    !Array.isArray(message.entity_ids)
+  ) {
     return hass.callWS(message);
   }
 
@@ -241,7 +436,10 @@ async function interceptCallWs(hass, vmConfig, message) {
   }
 
   const now = new Date();
-  const startTime = parseDate(message.start_time, new Date(now.getTime() - 86400000));
+  const startTime = parseDate(
+    message.start_time,
+    new Date(now.getTime() - 86400000),
+  );
   const endTime = parseDate(message.end_time, now);
 
   const [nativeHistory, vmHistory] = await Promise.all([
@@ -249,6 +447,7 @@ async function interceptCallWs(hass, vmConfig, message) {
       ? hass.callWS({ ...message, entity_ids: ids.native })
       : Promise.resolve({}),
     queryVmEntities(
+      hass,
       vmConfig,
       ids.vm,
       startTime,
@@ -272,7 +471,9 @@ function parseRestHistoryPath(path) {
     return null;
   }
 
-  const suffix = url.pathname.slice(index + marker.length).replace(/^\//, "");
+  const suffix = url.pathname
+    .slice(index + marker.length)
+    .replace(/^\//, "");
   const entityIds = (url.searchParams.get("filter_entity_id") ?? "")
     .split(",")
     .map((value) => value.trim())
@@ -280,7 +481,10 @@ function parseRestHistoryPath(path) {
 
   return {
     entityIds,
-    startTime: parseDate(suffix ? decodeURIComponent(suffix) : null, new Date(Date.now() - 86400000)),
+    startTime: parseDate(
+      suffix ? decodeURIComponent(suffix) : null,
+      new Date(Date.now() - 86400000),
+    ),
     endTime: parseDate(url.searchParams.get("end_time"), new Date()),
   };
 }
@@ -309,6 +513,7 @@ async function interceptCallApi(hass, vmConfig, method, path, ...args) {
   }
 
   const vmHistoryByEntity = await queryVmEntities(
+    hass,
     vmConfig,
     ids.vm,
     request.startTime,
@@ -324,8 +529,9 @@ async function interceptCallApi(hass, vmConfig, method, path, ...args) {
 
   // Home Assistant REST history is an array of per-entity arrays. Preserve the
   // request order so the upstream card sees the same shape as its normal API.
-  return request.entityIds.map((entityId) =>
-    vmHistoryByEntity[entityId] ?? nativeByEntity.get(entityId) ?? [],
+  return request.entityIds.map(
+    (entityId) =>
+      vmHistoryByEntity[entityId] ?? nativeByEntity.get(entityId) ?? [],
   );
 }
 

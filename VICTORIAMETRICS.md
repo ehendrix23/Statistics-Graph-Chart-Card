@@ -17,14 +17,14 @@ Existing `data_source` behavior is preserved:
 
 There is deliberately no automatic HA-to-VictoriaMetrics range switching in this first implementation.
 
-## Configuration
+## Recommended Home Assistant configuration: add-on Ingress
 
-Configure the VictoriaMetrics endpoint at card level and opt individual entities into it:
+For Home Assistant OS/Supervised installations running VictoriaMetrics as an add-on, use native Home Assistant Ingress. This keeps the VictoriaMetrics HTTP port private and uses the same authenticated, same-origin path Home Assistant uses for add-on panels.
 
 ```yaml
 type: custom:statistics-graph-chart-card
 victoriametrics:
-  url: /victoriametrics
+  addon_slug: victoriametrics
   step: 15m
   # Optional; defaults shown below:
   # query_path: /prometheus/api/v1/query_range
@@ -38,6 +38,41 @@ entities:
   - entity: sensor.indoor_temperature
     data_source: history
 ```
+
+When `addon_slug` is configured, the wrapper:
+
+1. asks Home Assistant for an Ingress session through the Supervisor WebSocket API;
+2. stores the returned `ingress_session` cookie with the same path/security attributes used by the Home Assistant frontend;
+3. fetches `/addons/<slug>/info` and uses the add-on's `ingress_url`;
+4. sends the VictoriaMetrics range query through that same-origin Ingress URL;
+5. validates the cached Ingress session at most once per minute and recreates it if validation fails;
+6. recreates the session once and retries the query if Ingress returns HTTP 401 or 403.
+
+The add-on must be installed, running, and expose Ingress.
+
+For the custom VictoriaMetrics add-on repository used with this fork, the slug is:
+
+```text
+victoriametrics
+```
+
+No VictoriaMetrics port needs to be exposed to the LAN or Internet for this mode.
+
+### Direct URL fallback
+
+For Home Assistant Container/Core installations, development environments, or another VictoriaMetrics deployment that is intentionally reachable by the browser, configure `url` instead:
+
+```yaml
+victoriametrics:
+  url: https://vm.example.local
+  step: 15m
+```
+
+If both `addon_slug` and `url` are present, `addon_slug` takes precedence.
+
+A direct URL is browser-side. CORS, TLS, mixed-content rules, and network reachability therefore apply. Do not place VictoriaMetrics credentials or secrets in Lovelace YAML.
+
+## Entity query
 
 `victoriametrics.query` is required for every entity using the VictoriaMetrics data source. The query must resolve to exactly one time series. This is intentional: metric naming and labels are installation-specific, so the card must not guess how a Home Assistant entity maps to a VictoriaMetrics series.
 
@@ -73,21 +108,6 @@ It sends:
 
 The response must be a successful `matrix` result. A query returning more than one series is rejected rather than silently combining series.
 
-## Browser/network requirement
-
-The card runs in the Home Assistant browser, so the VictoriaMetrics endpoint must be reachable from the browser running the dashboard.
-
-The recommended production layout is a same-origin reverse proxy, for example:
-
-```yaml
-victoriametrics:
-  url: /victoriametrics
-```
-
-This avoids browser CORS restrictions and HTTPS-to-HTTP mixed-content blocking. A direct cross-origin VictoriaMetrics URL can work only when the server/network path and CORS policy explicitly allow the Home Assistant frontend origin.
-
-Do not place VictoriaMetrics credentials or secrets in Lovelace YAML. Dashboard configuration is delivered to the browser. Authentication, if required, should be handled by a trusted reverse proxy or another server-side mechanism.
-
 ## Data adaptation
 
 For WebSocket history requests (`history/history_during_period`), VictoriaMetrics samples are converted to Home Assistant's compact history state shape:
@@ -115,14 +135,18 @@ This first implementation intentionally does not add:
 
 Those can be added after this explicit provider path has been exercised against the real Home Assistant + VictoriaMetrics environment.
 
-## Validation performed before commit
+## Validation performed before release
 
 The wrapper was syntax-checked with Node.js and exercised against mocks covering:
 
 1. translation of only `data_source: victoriametrics` entities into the upstream `history` pipeline;
-2. construction of `/prometheus/api/v1/query_range` requests;
-3. merging native HA history with VictoriaMetrics data through `history/history_during_period`;
-4. legacy REST History API compatibility;
-5. pass-through of unrelated Home Assistant WebSocket traffic.
+2. native Home Assistant add-on Ingress session creation and cookie handling;
+3. add-on information lookup and use of `ingress_url`;
+4. reuse of cached Ingress information/session;
+5. one-time session recreation and retry after HTTP 401/403;
+6. direct `url` fallback operation;
+7. construction of `/prometheus/api/v1/query_range` requests;
+8. merging native HA history with VictoriaMetrics data through `history/history_during_period`;
+9. pass-through of unrelated Home Assistant WebSocket traffic.
 
-Live Home Assistant/VictoriaMetrics validation is intentionally deferred until the planned Proxmox migration is complete.
+Live Home Assistant/VictoriaMetrics validation remains the next step after installation.
